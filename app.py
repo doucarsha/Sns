@@ -309,6 +309,7 @@ setInterval(load,30000);
 def index():
     return Response(PAGE, mimetype="text/html")
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="127.0.0.1", port=PORT)
