@@ -32,6 +32,19 @@ def init_db():
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS extras (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        store_number TEXT NOT NULL,
+        item TEXT NOT NULL,
+        quantity TEXT NOT NULL DEFAULT '1',
+        contact_name TEXT DEFAULT '',
+        contact_phone TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'available',
+        claimed_by_store TEXT DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )""")
     c.commit()
     c.close()
 
@@ -142,6 +155,108 @@ def cancel(rid):
 def healthz():
     return jsonify({"ok": True})
 
+# ---- Extras board: stores post inventory they have extra of ----
+
+@app.route("/api/extras", methods=["GET"])
+def list_extras():
+    c = db()
+    rows = c.execute("SELECT * FROM extras ORDER BY created_at DESC").fetchall()
+    c.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+@app.route("/api/extras", methods=["POST"])
+def create_extra():
+    d = request.get_json(force=True) or {}
+    store = (d.get("store_number") or "").strip()
+    item = (d.get("item") or "").strip()
+    if not store or not item:
+        return jsonify({"error": "Store number and item are required."}), 400
+    now = int(time.time())
+    c = db()
+    cur = c.execute("""INSERT INTO extras
+        (store_number, item, quantity, contact_name, contact_phone, notes, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,'available',?,?)""",
+        (store[:20], item[:200], (d.get("quantity") or "1").strip()[:20],
+         (d.get("contact_name") or "").strip()[:60],
+         (d.get("contact_phone") or "").strip()[:30], (d.get("notes") or "").strip()[:500],
+         now, now))
+    c.commit()
+    rid = cur.lastrowid
+    row = c.execute("SELECT * FROM extras WHERE id=?", (rid,)).fetchone()
+    c.close()
+    return jsonify(row_to_dict(row)), 201
+
+def _get_extra(eid):
+    c = db()
+    row = c.execute("SELECT * FROM extras WHERE id=?", (eid,)).fetchone()
+    c.close()
+    return row
+
+@app.route("/api/extras/<int:eid>/claim", methods=["POST"])
+def claim_extra(eid):
+    d = request.get_json(force=True) or {}
+    store = (d.get("store_number") or "").strip()
+    if not store:
+        return jsonify({"error": "Store number is required."}), 400
+    r = _get_extra(eid)
+    if not r:
+        return jsonify({"error": "Item not found."}), 404
+    if r["status"] != "available":
+        return jsonify({"error": "Item is no longer available."}), 409
+    now = int(time.time())
+    c = db()
+    c.execute("UPDATE extras SET status='claimed', claimed_by_store=?, updated_at=? WHERE id=?",
+              (store[:20], now, eid))
+    c.commit()
+    row = c.execute("SELECT * FROM extras WHERE id=?", (eid,)).fetchone()
+    c.close()
+    return jsonify(row_to_dict(row))
+
+@app.route("/api/extras/<int:eid>/unclaim", methods=["POST"])
+def unclaim_extra(eid):
+    r = _get_extra(eid)
+    if not r:
+        return jsonify({"error": "Item not found."}), 404
+    if r["status"] != "claimed":
+        return jsonify({"error": "Item is not claimed."}), 409
+    now = int(time.time())
+    c = db()
+    c.execute("UPDATE extras SET status='available', claimed_by_store='', updated_at=? WHERE id=?", (now, eid))
+    c.commit()
+    row = c.execute("SELECT * FROM extras WHERE id=?", (eid,)).fetchone()
+    c.close()
+    return jsonify(row_to_dict(row))
+
+@app.route("/api/extras/<int:eid>/taken", methods=["POST"])
+def taken_extra(eid):
+    r = _get_extra(eid)
+    if not r:
+        return jsonify({"error": "Item not found."}), 404
+    if r["status"] not in ("available", "claimed"):
+        return jsonify({"error": "Item is already closed."}), 409
+    now = int(time.time())
+    c = db()
+    c.execute("UPDATE extras SET status='taken', updated_at=? WHERE id=?", (now, eid))
+    c.commit()
+    row = c.execute("SELECT * FROM extras WHERE id=?", (eid,)).fetchone()
+    c.close()
+    return jsonify(row_to_dict(row))
+
+@app.route("/api/extras/<int:eid>/remove", methods=["POST"])
+def remove_extra(eid):
+    r = _get_extra(eid)
+    if not r:
+        return jsonify({"error": "Item not found."}), 404
+    if r["status"] not in ("available", "claimed"):
+        return jsonify({"error": "Item is already closed."}), 409
+    now = int(time.time())
+    c = db()
+    c.execute("UPDATE extras SET status='removed', updated_at=? WHERE id=?", (now, eid))
+    c.commit()
+    row = c.execute("SELECT * FROM extras WHERE id=?", (eid,)).fetchone()
+    c.close()
+    return jsonify(row_to_dict(row))
+
 PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -178,6 +293,8 @@ button{cursor:pointer;border:none;border-radius:8px;font-size:15px;font-weight:7
 .b-claimed{background:#fff3d6;color:#8a6400}
 .b-fulfilled{background:#e2f2e2;color:#1e6b1e}
 .b-cancelled{background:#eee;color:#666}
+.b-available{background:#e2f2e2;color:#1e6b1e}
+.b-taken{background:#eee;color:#666}
 .meta{font-size:13px;color:#666;margin-top:6px}
 .meta b{color:#333}
 .notes{font-size:14px;margin-top:8px;background:#fafafa;border-radius:6px;padding:8px}
@@ -212,6 +329,23 @@ footer{text-align:center;color:#999;font-size:12px;margin-top:30px}
 <button class="btn-red" type="submit">Post request</button>
 </form>
 </div>
+<div class="card" style="border-top:5px solid #1e7b1e">
+<h2>Post extra inventory</h2>
+<p style="font-size:13px;color:#666;margin-bottom:6px">Have extra on hand? Post it so another store can claim it.</p>
+<form id="extraForm">
+<div class="row2">
+<div><label>Your store number *</label><input id="x_store" required inputmode="numeric" placeholder="e.g. 1234"></div>
+<div><label>Quantity</label><input id="x_qty" value="1"></div>
+</div>
+<label>Item available *</label><input id="x_item" required placeholder="e.g. 5 gal vanilla shake mix">
+<div class="row2">
+<div><label>Your name</label><input id="x_name" placeholder="Manager on duty"></div>
+<div><label>Phone</label><input id="x_phone" inputmode="tel" placeholder="So the other store can reach you"></div>
+</div>
+<label>Notes</label><textarea id="x_notes" placeholder="Brand, size, pickup details"></textarea>
+<button class="btn-red" style="background:#1e7b1e" type="submit">Post extra</button>
+</form>
+</div>
 <div class="card search">
 <input id="q" placeholder="Search items or store numbers&hellip;">
 </div>
@@ -221,6 +355,10 @@ footer{text-align:center;color:#999;font-size:12px;margin-top:30px}
 <div id="claimed"></div>
 <h3 class="sec">Recently closed</h3>
 <div id="closed"></div>
+<h3 class="sec" style="color:#1e7b1e">Extra inventory &mdash; up for grabs</h3>
+<div id="extras"></div>
+<h3 class="sec">Extras claimed / taken</h3>
+<div id="extrasClosed"></div>
 <footer>Ohio Store Exchange &middot; for Steak 'n Shake Ohio region stores</footer>
 </div>
 <script>
@@ -298,8 +436,71 @@ $('reqForm').addEventListener('submit',async e=>{
   load();
   window.scrollTo({top:0,behavior:'smooth'});
 });
+let extras=[];
+async function loadExtras(){
+  const r=await fetch('/api/extras');
+  extras=await r.json();
+  renderExtras();
+}
+function xbadge(st){const m={available:['b-available','Available'],claimed:['b-claimed','Claimed'],taken:['b-taken','Taken'],removed:['b-cancelled','Removed']};const b=m[st]||m.available;return '<span class="badge '+b[0]+'">'+b[1]+'</span>';}
+function extraCard(r){
+  const cls=r.status==='available'?'':(r.status==='claimed'?'claimed':'done');
+  let h='<div class="card req '+cls+'" style="'+(r.status==='available'?'border-left-color:#1e7b1e':'')+'"><div class="top"><div class="item"></div>'+xbadge(r.status)+'</div>';
+  h+='<div class="meta">Store <b class="st"></b> &middot; Qty <b class="qt"></b> &middot; <span class="tm"></span></div>';
+  if(r.claimed_by_store)h+='<div class="meta">Claimed by store <b class="cb"></b></div>';
+  if(r.contact_name||r.contact_phone)h+='<div class="meta">Contact: <b class="cn"></b> <span class="cp"></span></div>';
+  if(r.notes)h+='<div class="notes"></div>';
+  h+='<div class="acts"></div></div>';
+  const t=document.createElement('template');t.innerHTML=h.trim();
+  const el=t.content.firstChild;
+  el.querySelector('.item').textContent=r.item;
+  el.querySelector('.st').textContent=r.store_number;
+  el.querySelector('.qt').textContent=r.quantity;
+  el.querySelector('.tm').textContent=fmtTime(r.created_at);
+  if(r.claimed_by_store)el.querySelector('.cb').textContent=r.claimed_by_store;
+  if(r.contact_name||r.contact_phone){
+    el.querySelector('.cn').textContent=r.contact_name||'';
+    el.querySelector('.cp').textContent=r.contact_phone?('('+r.contact_phone+')'):'';
+  }
+  if(r.notes)el.querySelector('.notes').textContent=r.notes;
+  const acts=el.querySelector('.acts');
+  function btn(label,cls,fn){const b=document.createElement('button');b.className='btn-sm '+cls;b.textContent=label;b.onclick=fn;acts.appendChild(b);}
+  if(r.status==='available'){
+    btn('Claim it','btn-dark',async()=>{
+      const s=prompt('Your store number:');
+      if(!s||!s.trim())return;
+      const res=await fetch('/api/extras/'+r.id+'/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({store_number:s.trim()})});
+      if(!res.ok){showErr((await res.json()).error||'Could not claim.');return;}
+      loadExtras();
+    });
+    btn('Mark taken','btn-outline',async()=>{await fetch('/api/extras/'+r.id+'/taken',{method:'POST'});loadExtras();});
+    btn('Remove','btn-outline',async()=>{if(confirm('Remove this listing?')){await fetch('/api/extras/'+r.id+'/remove',{method:'POST'});loadExtras();}});
+  }else if(r.status==='claimed'){
+    btn('Mark taken','btn-dark',async()=>{await fetch('/api/extras/'+r.id+'/taken',{method:'POST'});loadExtras();});
+    btn('Release claim','btn-outline',async()=>{await fetch('/api/extras/'+r.id+'/unclaim',{method:'POST'});loadExtras();});
+  }
+  return el;
+}
+function renderExtras(){
+  const avail=extras.filter(r=>r.status==='available');
+  const closed=extras.filter(r=>r.status==='claimed'||r.status==='taken').slice(0,20);
+  const put=(id,list,msg)=>{const e=$(id);e.innerHTML='';if(!list.length){e.innerHTML='<div class="card empty">'+msg+'</div>';return;}list.forEach(r=>e.appendChild(extraCard(r)));};
+  put('extras',avail,'No extras posted. Got overstock? Post it above.');
+  put('extrasClosed',closed,'Nothing claimed yet.');
+}
+$('extraForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const body={store_number:$('x_store').value,quantity:$('x_qty').value,item:$('x_item').value,
+    contact_name:$('x_name').value,contact_phone:$('x_phone').value,notes:$('x_notes').value};
+  const res=await fetch('/api/extras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!res.ok){showErr((await res.json()).error||'Could not post.');return;}
+  e.target.reset();$('x_qty').value='1';
+  loadExtras();
+});
 load();
+loadExtras();
 setInterval(load,30000);
+setInterval(loadExtras,30000);
 </script>
 </body>
 </html>
