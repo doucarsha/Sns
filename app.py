@@ -2,14 +2,35 @@
 """Ohio Steak 'n Shake Store Exchange - supply request board."""
 import os
 import sqlite3
+import threading
 import time
+import urllib.request
 from flask import Flask, request, jsonify, Response
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE, "exchange.db")
 PORT = int(os.environ.get("PORT", "8471"))
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 
 app = Flask(__name__)
+
+def notify_ntfy(title, message):
+    """Fire-and-forget push notification to all subscribed store phones."""
+    if not NTFY_TOPIC:
+        return
+    def _send():
+        try:
+            req = urllib.request.Request(
+                "https://ntfy.sh/" + NTFY_TOPIC,
+                data=message.encode("utf-8"),
+                headers={"Title": title, "Priority": "high", "Tags": "bell"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print("ntfy: published (%s)" % resp.status, flush=True)
+        except Exception as e:
+            print("ntfy: failed: %s" % e, flush=True)
+    threading.Thread(target=_send, daemon=True).start()
 
 def db():
     c = sqlite3.connect(DB)
@@ -78,6 +99,8 @@ def create_request():
     rid = cur.lastrowid
     row = c.execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
     c.close()
+    notify_ntfy("New request - Ohio Store Exchange",
+                "Store %s needs: %s (Qty %s)" % (store, item, (d.get("quantity") or "1").strip()[:20]))
     return jsonify(row_to_dict(row)), 201
 
 def _get(rid):
@@ -184,6 +207,8 @@ def create_extra():
     rid = cur.lastrowid
     row = c.execute("SELECT * FROM extras WHERE id=?", (rid,)).fetchone()
     c.close()
+    notify_ntfy("Extra available - Ohio Store Exchange",
+                "Store %s has extra: %s (Qty %s)" % (store, item, (d.get("quantity") or "1").strip()[:20]))
     return jsonify(row_to_dict(row)), 201
 
 def _get_extra(eid):
